@@ -495,3 +495,228 @@
 (define-read-only (has-voted-on-milestone (film-id uint) (milestone-id uint) (voter principal))
   (is-some (map-get? milestone-votes { film-id: film-id, milestone-id: milestone-id, voter: voter }))
 )
+
+
+(define-constant err-escrow-not-found (err u200))
+(define-constant err-escrow-already-exists (err u201))
+(define-constant err-invalid-stage (err u202))
+(define-constant err-stage-not-ready (err u203))
+(define-constant err-insufficient-escrow-balance (err u204))
+(define-constant err-escrow-completed (err u205))
+(define-constant err-unauthorized-escrow (err u206))
+
+(define-map escrow-accounts
+  { film-id: uint }
+  {
+    total-amount: uint,
+    released-amount: uint,
+    current-stage: uint,
+    total-stages: uint,
+    creator: principal,
+    is-completed: bool,
+    auto-release-enabled: bool
+  }
+)
+
+(define-map escrow-stages
+  { film-id: uint, stage: uint }
+  {
+    release-percentage: uint,
+    release-condition: (string-ascii 100),
+    release-date: uint,
+    is-released: bool,
+    amount: uint
+  }
+)
+
+(define-map escrow-balances
+  { film-id: uint }
+  { balance: uint }
+)
+
+(define-public (create-escrow-account (film-id uint) (creator principal) (total-amount uint) (total-stages uint))
+  (let ((escrow-exists (is-some (map-get? escrow-accounts { film-id: film-id }))))
+    (asserts! (not escrow-exists) err-escrow-already-exists)
+    (asserts! (> total-amount u0) err-insufficient-escrow-balance)
+    (asserts! (and (> total-stages u0) (<= total-stages u10)) err-invalid-stage)
+    
+    (map-set escrow-accounts
+      { film-id: film-id }
+      {
+        total-amount: total-amount,
+        released-amount: u0,
+        current-stage: u1,
+        total-stages: total-stages,
+        creator: creator,
+        is-completed: false,
+        auto-release-enabled: true
+      }
+    )
+    
+    (map-set escrow-balances
+      { film-id: film-id }
+      { balance: total-amount }
+    )
+    
+    (ok film-id)
+  )
+)
+
+(define-public (setup-escrow-stage (film-id uint) (stage uint) (release-percentage uint) (release-condition (string-ascii 100)) (release-date uint))
+  (let ((escrow (unwrap! (map-get? escrow-accounts { film-id: film-id }) err-escrow-not-found)))
+    (asserts! (is-eq tx-sender (get creator escrow)) err-unauthorized-escrow)
+    (asserts! (and (> stage u0) (<= stage (get total-stages escrow))) err-invalid-stage)
+    (asserts! (and (> release-percentage u0) (<= release-percentage u10000)) err-invalid-stage)
+    (asserts! (> release-date stacks-block-height) err-stage-not-ready)
+    
+    (let ((stage-amount (/ (* (get total-amount escrow) release-percentage) u10000)))
+      (map-set escrow-stages
+        { film-id: film-id, stage: stage }
+        {
+          release-percentage: release-percentage,
+          release-condition: release-condition,
+          release-date: release-date,
+          is-released: false,
+          amount: stage-amount
+        }
+      )
+    )
+    
+    (ok stage)
+  )
+)
+
+(define-public (release-escrow-stage (film-id uint) (stage uint))
+  (let ((escrow (unwrap! (map-get? escrow-accounts { film-id: film-id }) err-escrow-not-found))
+        (stage-info (unwrap! (map-get? escrow-stages { film-id: film-id, stage: stage }) err-invalid-stage))
+        (escrow-balance (unwrap! (map-get? escrow-balances { film-id: film-id }) err-escrow-not-found)))
+    
+    (asserts! (not (get is-completed escrow)) err-escrow-completed)
+    (asserts! (not (get is-released stage-info)) err-escrow-completed)
+    (asserts! (is-eq stage (get current-stage escrow)) err-stage-not-ready)
+    (asserts! (>= stacks-block-height (get release-date stage-info)) err-stage-not-ready)
+    (asserts! (>= (get balance escrow-balance) (get amount stage-info)) err-insufficient-escrow-balance)
+    
+    (let ((release-amount (get amount stage-info))
+          (new-released-amount (+ (get released-amount escrow) release-amount))
+          (new-balance (- (get balance escrow-balance) release-amount))
+          (is-final-stage (is-eq stage (get total-stages escrow))))
+      
+      (try! (as-contract (stx-transfer? release-amount tx-sender (get creator escrow))))
+      
+      (map-set escrow-stages
+        { film-id: film-id, stage: stage }
+        (merge stage-info { is-released: true })
+      )
+      
+      (map-set escrow-accounts
+        { film-id: film-id }
+        (merge escrow 
+          {
+            released-amount: new-released-amount,
+            current-stage: (if is-final-stage stage (+ stage u1)),
+            is-completed: is-final-stage
+          }
+        )
+      )
+      
+      (map-set escrow-balances
+        { film-id: film-id }
+        { balance: new-balance }
+      )
+      
+      (ok release-amount)
+    )
+  )
+)
+
+(define-public (fund-escrow (film-id uint) (amount uint))
+  (let ((escrow (unwrap! (map-get? escrow-accounts { film-id: film-id }) err-escrow-not-found))
+        (current-balance (unwrap! (map-get? escrow-balances { film-id: film-id }) err-escrow-not-found)))
+    
+    (asserts! (not (get is-completed escrow)) err-escrow-completed)
+    (asserts! (> amount u0) err-insufficient-escrow-balance)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set escrow-balances
+      { film-id: film-id }
+      { balance: (+ (get balance current-balance) amount) }
+    )
+    
+    (ok amount)
+  )
+)
+
+(define-public (emergency-pause-escrow (film-id uint))
+  (let ((escrow (unwrap! (map-get? escrow-accounts { film-id: film-id }) err-escrow-not-found)))
+    (asserts! (is-eq tx-sender (get creator escrow)) err-unauthorized-escrow)
+    
+    (map-set escrow-accounts
+      { film-id: film-id }
+      (merge escrow { auto-release-enabled: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resume-escrow (film-id uint))
+  (let ((escrow (unwrap! (map-get? escrow-accounts { film-id: film-id }) err-escrow-not-found)))
+    (asserts! (is-eq tx-sender (get creator escrow)) err-unauthorized-escrow)
+    
+    (map-set escrow-accounts
+      { film-id: film-id }
+      (merge escrow { auto-release-enabled: true })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-escrow-account (film-id uint))
+  (map-get? escrow-accounts { film-id: film-id })
+)
+
+(define-read-only (get-escrow-stage (film-id uint) (stage uint))
+  (map-get? escrow-stages { film-id: film-id, stage: stage })
+)
+
+(define-read-only (get-escrow-balance (film-id uint))
+  (match (map-get? escrow-balances { film-id: film-id })
+    balance (get balance balance)
+    u0
+  )
+)
+
+(define-read-only (get-next-release-amount (film-id uint))
+  (match (map-get? escrow-accounts { film-id: film-id })
+    escrow
+      (match (map-get? escrow-stages { film-id: film-id, stage: (get current-stage escrow) })
+        stage-info (get amount stage-info)
+        u0)
+    u0
+  )
+)
+
+(define-read-only (is-stage-ready-for-release (film-id uint) (stage uint))
+  (match (map-get? escrow-stages { film-id: film-id, stage: stage })
+    stage-info
+      (and 
+        (not (get is-released stage-info))
+        (>= stacks-block-height (get release-date stage-info))
+      )
+    false
+  )
+)
+
+(define-read-only (get-total-escrow-progress (film-id uint))
+  (match (map-get? escrow-accounts { film-id: film-id })
+    escrow
+      (if (> (get total-amount escrow) u0)
+        (/ (* (get released-amount escrow) u10000) (get total-amount escrow))
+        u0)
+    u0
+  )
+)
+
