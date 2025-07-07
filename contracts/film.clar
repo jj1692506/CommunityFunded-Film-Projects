@@ -720,3 +720,175 @@
   )
 )
 
+(define-constant err-reputation-not-found (err u300))
+(define-constant err-film-not-completed (err u301))
+(define-constant err-reputation-already-updated (err u302))
+(define-constant err-invalid-score (err u303))
+
+(define-map creator-reputation
+  { creator: principal }
+  {
+    total-films: uint,
+    successful-films: uint,
+    on-time-deliveries: uint,
+    total-funds-raised: uint,
+    average-rating: uint,
+    reputation-score: uint,
+    last-updated: uint
+  }
+)
+
+(define-map film-completion-status
+  { film-id: uint }
+  {
+    is-project-completed: bool,
+    completion-date: uint,
+    was-on-time: bool,
+    final-rating: uint,
+    reputation-updated: bool
+  }
+)
+
+(define-public (initialize-creator-reputation (creator principal))
+  (let ((reputation-exists (is-some (map-get? creator-reputation { creator: creator }))))
+    (if reputation-exists
+      (ok false)
+      (begin
+        (map-set creator-reputation
+          { creator: creator }
+          {
+            total-films: u0,
+            successful-films: u0,
+            on-time-deliveries: u0,
+            total-funds-raised: u0,
+            average-rating: u0,
+            reputation-score: u5000,
+            last-updated: stacks-block-height
+          }
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-public (finalize-film-project (film-id uint) (final-rating uint))
+  (let ((film (unwrap! (map-get? films { film-id: film-id }) err-not-found))
+        (release-status (unwrap! (map-get? film-release-status { film-id: film-id }) err-not-released))
+        (completion-exists (is-some (map-get? film-completion-status { film-id: film-id }))))
+    
+    (asserts! (is-eq tx-sender (get creator film)) err-unauthorized)
+    (asserts! (not (get is-active film)) err-funding-active)
+    (asserts! (get is-funded film) err-min-funding-not-met)
+    (asserts! (get is-released release-status) err-not-released)
+    (asserts! (not completion-exists) err-film-not-completed)
+    (asserts! (and (>= final-rating u0) (<= final-rating u500)) err-invalid-score)
+    
+    (let ((deadline (get deadline film))
+          (release-date (get release-date release-status))
+          (was-on-time (<= release-date deadline)))
+      
+      (map-set film-completion-status
+        { film-id: film-id }
+        {
+          is-project-completed: true,
+          completion-date: stacks-block-height,
+          was-on-time: was-on-time,
+          final-rating: final-rating,
+          reputation-updated: false
+        }
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (update-creator-reputation (film-id uint))
+  (let ((film (unwrap! (map-get? films { film-id: film-id }) err-not-found))
+        (completion-status (unwrap! (map-get? film-completion-status { film-id: film-id }) err-film-not-completed))
+        (creator (get creator film))
+        (current-reputation (default-to 
+          { total-films: u0, successful-films: u0, on-time-deliveries: u0, total-funds-raised: u0, average-rating: u0, reputation-score: u5000, last-updated: u0 }
+          (map-get? creator-reputation { creator: creator }))))
+    
+    (asserts! (get is-project-completed completion-status) err-film-not-completed)
+    (asserts! (not (get reputation-updated completion-status)) err-reputation-already-updated)
+    (asserts! (get is-funded film) err-min-funding-not-met)
+    
+    (let ((new-total-films (+ (get total-films current-reputation) u1))
+          (new-successful-films (+ (get successful-films current-reputation) u1))
+          (new-on-time-deliveries (+ (get on-time-deliveries current-reputation) (if (get was-on-time completion-status) u1 u0)))
+          (new-total-funds-raised (+ (get total-funds-raised current-reputation) (get total-raised film)))
+          (final-rating (get final-rating completion-status))
+          (current-avg-rating (get average-rating current-reputation))
+          (new-average-rating (if (> (get total-films current-reputation) u0)
+                                (/ (+ (* current-avg-rating (get total-films current-reputation)) final-rating) new-total-films)
+                                final-rating))
+          (success-rate (/ (* new-successful-films u10000) new-total-films))
+          (on-time-rate (/ (* new-on-time-deliveries u10000) new-total-films))
+          (rating-score (/ (* new-average-rating u2000) u500))
+          (new-reputation-score (/ (+ success-rate on-time-rate rating-score) u3)))
+      
+      (map-set creator-reputation
+        { creator: creator }
+        {
+          total-films: new-total-films,
+          successful-films: new-successful-films,
+          on-time-deliveries: new-on-time-deliveries,
+          total-funds-raised: new-total-funds-raised,
+          average-rating: new-average-rating,
+          reputation-score: new-reputation-score,
+          last-updated: stacks-block-height
+        }
+      )
+      
+      (map-set film-completion-status
+        { film-id: film-id }
+        (merge completion-status { reputation-updated: true })
+      )
+      
+      (ok new-reputation-score)
+    )
+  )
+)
+
+(define-read-only (get-creator-reputation (creator principal))
+  (map-get? creator-reputation { creator: creator })
+)
+
+(define-read-only (get-film-completion-status (film-id uint))
+  (map-get? film-completion-status { film-id: film-id })
+)
+
+(define-read-only (get-creator-success-rate (creator principal))
+  (match (map-get? creator-reputation { creator: creator })
+    reputation
+      (if (> (get total-films reputation) u0)
+        (/ (* (get successful-films reputation) u10000) (get total-films reputation))
+        u0)
+    u0
+  )
+)
+
+(define-read-only (get-creator-on-time-rate (creator principal))
+  (match (map-get? creator-reputation { creator: creator })
+    reputation
+      (if (> (get total-films reputation) u0)
+        (/ (* (get on-time-deliveries reputation) u10000) (get total-films reputation))
+        u0)
+    u0
+  )
+)
+
+(define-read-only (is-creator-reliable (creator principal))
+  (match (map-get? creator-reputation { creator: creator })
+    reputation
+      (and 
+        (>= (get reputation-score reputation) u7000)
+        (>= (get total-films reputation) u3)
+      )
+    false
+  )
+)
+
