@@ -892,3 +892,329 @@
   )
 )
 
+;; Distribution Partnership & Revenue Tracking System
+(define-constant err-partner-not-found (err u400))
+(define-constant err-partner-already-exists (err u401))
+(define-constant err-deal-not-found (err u402))
+(define-constant err-deal-already-exists (err u403))
+(define-constant err-invalid-percentage (err u404))
+(define-constant err-channel-not-found (err u405))
+(define-constant err-unauthorized-partner (err u406))
+(define-constant err-deal-expired (err u407))
+(define-constant err-insufficient-revenue (err u408))
+
+;; Distribution partners registry
+(define-map distribution-partners
+  { partner-id: uint }
+  {
+    name: (string-ascii 100),
+    partner-address: principal,
+    reputation-score: uint,
+    total-deals: uint,
+    total-revenue-generated: uint,
+    average-performance: uint,
+    is-verified: bool,
+    registration-date: uint
+  }
+)
+
+;; Film distribution deals
+(define-map film-distribution-deals
+  { film-id: uint, partner-id: uint }
+  {
+    deal-type: (string-ascii 50), ;; "streaming", "theatrical", "merchandise", "licensing"
+    partner-revenue-share: uint, ;; basis points (0-10000)
+    backer-revenue-share: uint, ;; basis points (0-10000)
+    creator-revenue-share: uint, ;; basis points (0-10000)
+    minimum-guarantee: uint,
+    deal-duration: uint,
+    territory: (string-ascii 50), ;; "global", "us", "eu", etc
+    is-active: bool,
+    deal-start-date: uint,
+    total-revenue-earned: uint
+  }
+)
+
+;; Revenue channels tracking
+(define-map revenue-channels
+  { film-id: uint, partner-id: uint, channel-id: uint }
+  {
+    channel-name: (string-ascii 100),
+    revenue-type: (string-ascii 50),
+    total-revenue: uint,
+    revenue-this-period: uint,
+    last-updated: uint,
+    performance-metrics: uint
+  }
+)
+
+;; Revenue distribution tracking
+(define-map revenue-distributions
+  { film-id: uint, partner-id: uint, distribution-id: uint }
+  {
+    revenue-amount: uint,
+    partner-amount: uint,
+    backer-pool-amount: uint,
+    creator-amount: uint,
+    distribution-date: uint,
+    channel-source: uint
+  }
+)
+
+;; Partner performance metrics
+(define-map partner-performance
+  { partner-id: uint }
+  {
+    total-films-distributed: uint,
+    average-revenue-per-film: uint,
+    on-time-payments: uint,
+    total-payments: uint,
+    reliability-score: uint,
+    last-performance-update: uint
+  }
+)
+
+;; Register a new distribution partner
+(define-public (register-distribution-partner (partner-id uint) (name (string-ascii 100)) (partner-address principal))
+  (let ((partner-exists (is-some (map-get? distribution-partners { partner-id: partner-id }))))
+    (asserts! (not partner-exists) err-partner-already-exists)
+    (asserts! (> (len name) u0) err-invalid-percentage)
+    
+    (map-set distribution-partners
+      { partner-id: partner-id }
+      {
+        name: name,
+        partner-address: partner-address,
+        reputation-score: u5000, ;; start with neutral score
+        total-deals: u0,
+        total-revenue-generated: u0,
+        average-performance: u0,
+        is-verified: false,
+        registration-date: stacks-block-height
+      }
+    )
+    
+    (map-set partner-performance
+      { partner-id: partner-id }
+      {
+        total-films-distributed: u0,
+        average-revenue-per-film: u0,
+        on-time-payments: u0,
+        total-payments: u0,
+        reliability-score: u5000,
+        last-performance-update: stacks-block-height
+      }
+    )
+    
+    (ok partner-id)
+  )
+)
+
+;; Create distribution deal between film and partner
+(define-public (create-distribution-deal 
+  (film-id uint) 
+  (partner-id uint) 
+  (deal-type (string-ascii 50))
+  (partner-share uint)
+  (backer-share uint)
+  (creator-share uint)
+  (minimum-guarantee uint)
+  (deal-duration uint)
+  (territory (string-ascii 50)))
+  
+  (let ((film (unwrap! (map-get? films { film-id: film-id }) err-not-found))
+        (partner (unwrap! (map-get? distribution-partners { partner-id: partner-id }) err-partner-not-found))
+        (deal-exists (is-some (map-get? film-distribution-deals { film-id: film-id, partner-id: partner-id }))))
+    
+    ;; Only film creator can create deals
+    (asserts! (is-eq tx-sender (get creator film)) err-unauthorized)
+    (asserts! (not deal-exists) err-deal-already-exists)
+    (asserts! (get is-funded film) err-min-funding-not-met)
+    
+    ;; Revenue shares must total 10000 basis points (100%)
+    (asserts! (is-eq (+ partner-share (+ backer-share creator-share)) u10000) err-invalid-percentage)
+    (asserts! (> deal-duration stacks-block-height) err-deal-expired)
+    
+    (map-set film-distribution-deals
+      { film-id: film-id, partner-id: partner-id }
+      {
+        deal-type: deal-type,
+        partner-revenue-share: partner-share,
+        backer-revenue-share: backer-share,
+        creator-revenue-share: creator-share,
+        minimum-guarantee: minimum-guarantee,
+        deal-duration: deal-duration,
+        territory: territory,
+        is-active: true,
+        deal-start-date: stacks-block-height,
+        total-revenue-earned: u0
+      }
+    )
+    
+    ;; Update partner statistics
+    (let ((updated-partner (merge partner { total-deals: (+ (get total-deals partner) u1) })))
+      (map-set distribution-partners
+        { partner-id: partner-id }
+        updated-partner
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Record revenue from a specific channel
+(define-public (record-channel-revenue 
+  (film-id uint) 
+  (partner-id uint) 
+  (channel-id uint)
+  (channel-name (string-ascii 100))
+  (revenue-type (string-ascii 50))
+  (revenue-amount uint))
+  
+  (let ((deal (unwrap! (map-get? film-distribution-deals { film-id: film-id, partner-id: partner-id }) err-deal-not-found))
+        (partner (unwrap! (map-get? distribution-partners { partner-id: partner-id }) err-partner-not-found))
+        (existing-channel (default-to 
+          { channel-name: "", revenue-type: "", total-revenue: u0, revenue-this-period: u0, last-updated: u0, performance-metrics: u0 }
+          (map-get? revenue-channels { film-id: film-id, partner-id: partner-id, channel-id: channel-id }))))
+    
+    ;; Only partner can record revenue
+    (asserts! (is-eq tx-sender (get partner-address partner)) err-unauthorized-partner)
+    (asserts! (get is-active deal) err-deal-expired)
+    (asserts! (< stacks-block-height (get deal-duration deal)) err-deal-expired)
+    (asserts! (> revenue-amount u0) err-insufficient-revenue)
+    
+    ;; Update channel revenue
+    (map-set revenue-channels
+      { film-id: film-id, partner-id: partner-id, channel-id: channel-id }
+      {
+        channel-name: channel-name,
+        revenue-type: revenue-type,
+        total-revenue: (+ (get total-revenue existing-channel) revenue-amount),
+        revenue-this-period: revenue-amount,
+        last-updated: stacks-block-height,
+        performance-metrics: (/ (* revenue-amount u100) (+ (get total-revenue existing-channel) revenue-amount))
+      }
+    )
+    
+    ;; Update deal total revenue
+    (map-set film-distribution-deals
+      { film-id: film-id, partner-id: partner-id }
+      (merge deal { total-revenue-earned: (+ (get total-revenue-earned deal) revenue-amount) })
+    )
+    
+    (ok revenue-amount)
+  )
+)
+
+;; Distribute revenue to backers, creator, and partner
+(define-public (distribute-channel-revenue (film-id uint) (partner-id uint) (distribution-id uint) (revenue-amount uint))
+  (let ((deal (unwrap! (map-get? film-distribution-deals { film-id: film-id, partner-id: partner-id }) err-deal-not-found))
+        (film (unwrap! (map-get? films { film-id: film-id }) err-not-found))
+        (partner (unwrap! (map-get? distribution-partners { partner-id: partner-id }) err-partner-not-found)))
+    
+    ;; Only partner can initiate distribution
+    (asserts! (is-eq tx-sender (get partner-address partner)) err-unauthorized-partner)
+    (asserts! (get is-active deal) err-deal-expired)
+    (asserts! (> revenue-amount u0) err-insufficient-revenue)
+    
+    (let ((partner-amount (/ (* revenue-amount (get partner-revenue-share deal)) u10000))
+          (backer-amount (/ (* revenue-amount (get backer-revenue-share deal)) u10000))
+          (creator-amount (/ (* revenue-amount (get creator-revenue-share deal)) u10000)))
+      
+      ;; Transfer funds (simplified - in real implementation would need escrow)
+      (try! (stx-transfer? backer-amount tx-sender (as-contract tx-sender))) ;; to backer pool
+      (try! (stx-transfer? creator-amount tx-sender (get creator film)))
+      
+      ;; Record distribution
+      (map-set revenue-distributions
+        { film-id: film-id, partner-id: partner-id, distribution-id: distribution-id }
+        {
+          revenue-amount: revenue-amount,
+          partner-amount: partner-amount,
+          backer-pool-amount: backer-amount,
+          creator-amount: creator-amount,
+          distribution-date: stacks-block-height,
+          channel-source: u1 ;; could be dynamic based on channel
+        }
+      )
+      
+      ;; Update partner performance
+      (let ((performance (default-to 
+            { total-films-distributed: u0, average-revenue-per-film: u0, on-time-payments: u0, total-payments: u0, reliability-score: u5000, last-performance-update: u0 }
+            (map-get? partner-performance { partner-id: partner-id }))))
+        
+        (map-set partner-performance
+          { partner-id: partner-id }
+          {
+            total-films-distributed: (get total-films-distributed performance),
+            average-revenue-per-film: (if (> (get total-films-distributed performance) u0)
+                                        (/ (+ (* (get average-revenue-per-film performance) (get total-films-distributed performance)) revenue-amount)
+                                           (+ (get total-films-distributed performance) u1))
+                                        revenue-amount),
+            on-time-payments: (+ (get on-time-payments performance) u1),
+            total-payments: (+ (get total-payments performance) u1),
+            reliability-score: (if (> (+ (get reliability-score performance) u100) u10000) u10000 (+ (get reliability-score performance) u100)),
+            last-performance-update: stacks-block-height
+          }
+        )
+      )
+      
+      (ok { partner-amount: partner-amount, backer-amount: backer-amount, creator-amount: creator-amount })
+    )
+  )
+)
+
+;; Verify distribution partner (admin function)
+(define-public (verify-distribution-partner (partner-id uint))
+  (let ((partner (unwrap! (map-get? distribution-partners { partner-id: partner-id }) err-partner-not-found)))
+    (asserts! (is-eq tx-sender (var-get contract-owner)) err-owner-only)
+    
+    (map-set distribution-partners
+      { partner-id: partner-id }
+      (merge partner { is-verified: true })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Read-only functions for distribution system
+(define-read-only (get-distribution-partner (partner-id uint))
+  (map-get? distribution-partners { partner-id: partner-id })
+)
+
+(define-read-only (get-distribution-deal (film-id uint) (partner-id uint))
+  (map-get? film-distribution-deals { film-id: film-id, partner-id: partner-id })
+)
+
+(define-read-only (get-channel-revenue (film-id uint) (partner-id uint) (channel-id uint))
+  (map-get? revenue-channels { film-id: film-id, partner-id: partner-id, channel-id: channel-id })
+)
+
+(define-read-only (get-revenue-distribution (film-id uint) (partner-id uint) (distribution-id uint))
+  (map-get? revenue-distributions { film-id: film-id, partner-id: partner-id, distribution-id: distribution-id })
+)
+
+(define-read-only (get-partner-performance (partner-id uint))
+  (map-get? partner-performance { partner-id: partner-id })
+)
+
+(define-read-only (get-film-total-distribution-revenue (film-id uint))
+  (ok u0) ;; placeholder - would iterate through all deals for film
+)
+
+(define-read-only (is-partner-reliable (partner-id uint))
+  (match (map-get? partner-performance { partner-id: partner-id })
+    performance
+      (and 
+        (>= (get reliability-score performance) u7000)
+        (>= (get total-films-distributed performance) u3)
+        (>= (/ (* (get on-time-payments performance) u10000) (get total-payments performance)) u8000)
+      )
+    false
+  )
+)
+
+
+
